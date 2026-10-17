@@ -18,7 +18,20 @@ class ProblemService {
   /**
    * Report a problem: can be linked to a Task (Task Problem) or a Project (Project Problem), or both.
    */
-  async reportProblem({ taskId = null, projectId = null, reportedById, description }) {
+  async reportProblem(arg1, arg2, arg3) {
+    let taskId = null;
+    let projectId = null;
+    let reportedById = null;
+    let description = null;
+
+    if (typeof arg1 === 'object' && arg1 !== null) {
+      ({ taskId = null, projectId = null, reportedById, description } = arg1);
+    } else {
+      taskId = arg1;
+      reportedById = arg2;
+      description = arg3;
+    }
+
     const strReportedById = String(reportedById);
 
     if (!description || !description.trim()) {
@@ -31,7 +44,20 @@ class ProblemService {
       throw err;
     }
 
-    const strTaskId = taskId ? String(taskId) : null;
+    let strTaskId = taskId ? String(taskId) : null;
+    if (strTaskId && !strTaskId.includes('-')) {
+      try {
+        const taskDb = require('../../task-service/src/config/prisma');
+        const foundTask = await taskDb.task.findFirst({
+          where: { id: parseInt(strTaskId, 10) }
+        });
+        if (foundTask && foundTask.outer_id) {
+          strTaskId = foundTask.outer_id;
+        }
+      } catch (e) {
+        // fallback
+      }
+    }
     const strProjectId = projectId ? String(projectId) : null;
 
     const problem = await prisma.problem.create({
@@ -54,7 +80,7 @@ class ProblemService {
         reported_by_id: strReportedById,
         status: 'OPEN',
       });
-      this.notifyTaskServiceBlock(strTaskId, problem.outer_id || problem.id).catch(() => {});
+      await this.notifyTaskServiceBlock(strTaskId, problem.outer_id || problem.id).catch(() => {});
     } else {
       publishProblemEvent('problem.reported', {
         id: problem.id,
@@ -91,37 +117,56 @@ class ProblemService {
     let resolutionTaskId = null;
     let resolutionTask = null;
 
-    try {
-      const resp = await fetch(`${TASK_SERVICE_URL}/api/tasks/`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': taskOverrides.authHeader || '',
-          'x-user-id': String(employeeId),
-        },
-        body: JSON.stringify({
+    if (this.mockTaskCreator) {
+      try {
+        resolutionTask = await this.mockTaskCreator({
           title: taskTitle,
           description: taskDescription,
           priority: taskOverrides.priority || 'HIGH',
-          assignment_mode: 'DIRECT',
-          direct_assignee_id: directAssigneeId,
-          project_id: problem.project_id || null,
-          problem_id: problem.outer_id || String(problem.id),
-        }),
-      });
-
-      if (resp.ok) {
-        resolutionTask = await resp.json();
-        resolutionTaskId = resolutionTask.outer_id || String(resolutionTask.id);
+          assignmentMode: taskOverrides.assignment_mode || 'DIRECT',
+          directAssigneeId: directAssigneeId,
+          projectId: problem.project_id || null,
+          problemId: problem.outer_id || String(problem.id),
+        }, employeeId);
+        resolutionTaskId = resolutionTask?.outer_id || (resolutionTask?.id ? String(resolutionTask.id) : null);
+      } catch (mockErr) {
+        console.warn('[Problem Service] mockTaskCreator failed:', mockErr.message);
       }
-    } catch (err) {
-      console.warn('[Problem Service] Could not reach Task Service:', err.message);
     }
 
     if (!resolutionTaskId) {
-      const { v4: uuidv4 } = require('crypto');
-      resolutionTaskId = uuidv4 ? uuidv4() : String(Date.now());
-      resolutionTask = { id: resolutionTaskId, title: taskTitle, problem_id: problem.id };
+      try {
+        const resp = await fetch(`${TASK_SERVICE_URL}/api/tasks/`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': taskOverrides.authHeader || '',
+            'x-user-id': String(employeeId),
+          },
+          body: JSON.stringify({
+            title: taskTitle,
+            description: taskDescription,
+            priority: taskOverrides.priority || 'HIGH',
+            assignment_mode: 'DIRECT',
+            direct_assignee_id: directAssigneeId,
+            project_id: problem.project_id || null,
+            problem_id: problem.outer_id || String(problem.id),
+          }),
+        });
+
+        if (resp.ok) {
+          resolutionTask = await resp.json();
+          resolutionTaskId = resolutionTask.outer_id || String(resolutionTask.id);
+        }
+      } catch (err) {
+        console.warn('[Problem Service] Could not reach Task Service:', err.message);
+      }
+    }
+
+    if (!resolutionTaskId) {
+      const crypto = require('crypto');
+      resolutionTaskId = crypto.randomUUID();
+      resolutionTask = { id: resolutionTaskId, outer_id: resolutionTaskId, title: taskTitle, problem_id: problem.id };
     }
 
     const updatedProblem = await prisma.problem.update({
@@ -225,7 +270,7 @@ class ProblemService {
       }
 
       return { resolvedProblem, remainingCount, taskId: targetProblem.task_id };
-    }).then(({ resolvedProblem, remainingCount, taskId }) => {
+    }).then(async ({ resolvedProblem, remainingCount, taskId }) => {
       if (taskId && remainingCount === 0) {
         publishProblemEvent('problem.resolved', {
           id: resolvedProblem.id,
@@ -234,7 +279,7 @@ class ProblemService {
           resolver_id: strResolverId,
           status: 'RESOLVED',
         });
-        this.notifyTaskServiceUnblock(taskId, resolvedProblem.outer_id || resolvedProblem.id).catch(() => {});
+        await this.notifyTaskServiceUnblock(taskId, resolvedProblem.outer_id || resolvedProblem.id).catch(() => {});
       }
       return resolvedProblem;
     });

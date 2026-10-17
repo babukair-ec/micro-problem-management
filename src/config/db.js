@@ -13,10 +13,11 @@ async function seedDefaultEmployees() {
   ];
 
   for (const emp of employees) {
+    const { id, ...rest } = emp;
     await prisma.employeeCache.upsert({
-      where: { id: emp.id },
-      create: emp,
-      update: emp,
+      where: { outer_id: id },
+      create: { outer_id: id, ...rest },
+      update: rest,
     });
   }
 }

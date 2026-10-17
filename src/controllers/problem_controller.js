@@ -13,11 +13,12 @@ class ProblemController {
 
   async listProblems(req, res) {
     try {
-      const { task_id } = req.query;
-      if (!task_id) {
-        return res.status(400).json({ error: 'task_id query param is required' });
-      }
-      const problems = await problemService.listProblemsForTask(task_id);
+      const { task_id, project_id, status } = req.query;
+      const problems = await problemService.listProblems({
+        taskId: task_id,
+        projectId: project_id,
+        status: status,
+      });
       res.json(problems);
     } catch (err) {
       res.status(500).json({ error: err.message });
@@ -26,10 +27,31 @@ class ProblemController {
 
   async reportProblem(req, res) {
     try {
-      const { task_id, description } = req.body;
-      if (!task_id) return res.status(400).json({ error: 'task_id is required' });
-      const problem = await problemService.reportProblem(task_id, req.user.employeeId, description);
+      const { task_id, project_id, description } = req.body;
+      if (!task_id && !project_id) {
+        return res.status(400).json({ error: 'A problem must be associated with a Task or a Project' });
+      }
+      const problem = await problemService.reportProblem({
+        taskId: task_id,
+        projectId: project_id,
+        reportedById: req.user.employeeId,
+        description,
+      });
       res.status(201).json(problem);
+    } catch (err) {
+      const status = err.status || 400;
+      res.status(status).json({ error: err.message });
+    }
+  }
+
+  async createResolutionTask(req, res) {
+    try {
+      const result = await problemService.createResolutionTask(
+        req.params.id,
+        req.user.employeeId,
+        req.body
+      );
+      res.status(201).json(result);
     } catch (err) {
       const status = err.status || 400;
       res.status(status).json({ error: err.message });

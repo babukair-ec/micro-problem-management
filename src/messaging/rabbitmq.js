@@ -25,26 +25,31 @@ async function startRabbitMQ() {
           const content = JSON.parse(msg.content.toString());
           if (content.event === 'employee.created' || content.event === 'employee.updated') {
             const emp = content.data;
-            await prisma.employeeCache.upsert({
-              where: { id: parseInt(emp.id, 10) },
-              create: {
-                id: parseInt(emp.id, 10),
-                username: emp.username,
-                full_name: emp.full_name || emp.username,
-                email: emp.email || '',
-                department: emp.department || '',
-                job_title: emp.job_title || '',
-                is_active: emp.is_active !== false,
-              },
-              update: {
-                username: emp.username,
-                full_name: emp.full_name || emp.username,
-                email: emp.email || '',
-                department: emp.department || '',
-                job_title: emp.job_title || '',
-                is_active: emp.is_active !== false,
-              }
-            });
+            const outerId = String(emp.outer_id || emp.id || '');
+            if (outerId) {
+              await prisma.employeeCache.upsert({
+                where: { outer_id: outerId },
+                create: {
+                  outer_id: outerId,
+                  username: emp.username,
+                  full_name: emp.full_name || emp.username,
+                  email: emp.email || '',
+                  department: emp.department || '',
+                  job_title: emp.job_title || '',
+                  employee_type: emp.employee_type || 'EMPLOYEE',
+                  is_active: emp.is_active !== false,
+                },
+                update: {
+                  username: emp.username,
+                  full_name: emp.full_name || emp.username,
+                  email: emp.email || '',
+                  department: emp.department || '',
+                  job_title: emp.job_title || '',
+                  employee_type: emp.employee_type || 'EMPLOYEE',
+                  is_active: emp.is_active !== false,
+                }
+              });
+            }
           }
           channel.ack(msg);
         } catch (err) {

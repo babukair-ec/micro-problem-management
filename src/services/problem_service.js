@@ -3,50 +3,146 @@ const { publishProblemEvent } = require('../messaging/rabbitmq');
 
 const TASK_SERVICE_URL = process.env.TASK_SERVICE_URL || 'http://localhost:5001';
 
+function getProblemWhereClause(problemId) {
+  if (typeof problemId === 'number') {
+    return { id: problemId };
+  }
+  const strId = String(problemId);
+  if (!isNaN(strId) && !strId.includes('-')) {
+    return { id: parseInt(strId, 10) };
+  }
+  return { outer_id: strId };
+}
+
 class ProblemService {
   /**
-   * Report a blocking problem on a task using Prisma
+   * Report a problem: can be linked to a Task (Task Problem) or a Project (Project Problem), or both.
    */
-  async reportProblem(taskId, reportedById, description) {
-    const numericTaskId = parseInt(taskId, 10);
-    const numericReportedById = parseInt(reportedById, 10);
+  async reportProblem({ taskId = null, projectId = null, reportedById, description }) {
+    const strReportedById = String(reportedById);
 
     if (!description || !description.trim()) {
       throw new Error('Problem description is required');
     }
 
+    if (!taskId && !projectId) {
+      const err = new Error('A problem must be associated with a Task or a Project (or both)');
+      err.status = 400;
+      throw err;
+    }
+
+    const strTaskId = taskId ? String(taskId) : null;
+    const strProjectId = projectId ? String(projectId) : null;
+
     const problem = await prisma.problem.create({
       data: {
-        task_id: numericTaskId,
-        reported_by_id: numericReportedById,
+        task_id: strTaskId,
+        project_id: strProjectId,
+        reported_by_id: strReportedById,
         description: description.trim(),
         status: 'OPEN',
       }
     });
 
-    // Publish event for Task Service to transition task status to BLOCKED
-    publishProblemEvent('problem.reported', {
-      id: problem.id,
-      task_id: numericTaskId,
-      reported_by_id: numericReportedById,
-      status: 'OPEN',
-    });
-
-    // Also attempt direct HTTP trigger to Task Service
-    this.notifyTaskServiceBlock(numericTaskId, problem.id).catch(() => {});
+    // If linked to a task, trigger task blocking
+    if (strTaskId) {
+      publishProblemEvent('problem.reported', {
+        id: problem.id,
+        outer_id: problem.outer_id,
+        task_id: strTaskId,
+        project_id: strProjectId,
+        reported_by_id: strReportedById,
+        status: 'OPEN',
+      });
+      this.notifyTaskServiceBlock(strTaskId, problem.outer_id || problem.id).catch(() => {});
+    } else {
+      publishProblemEvent('problem.reported', {
+        id: problem.id,
+        outer_id: problem.outer_id,
+        project_id: strProjectId,
+        reported_by_id: strReportedById,
+        status: 'OPEN',
+      });
+    }
 
     return problem;
+  }
+
+  /**
+   * Create a resolution task for a problem in Task Service
+   */
+  async createResolutionTask(problemId, employeeId, taskOverrides = {}) {
+    const problem = await prisma.problem.findFirst({
+      where: getProblemWhereClause(problemId)
+    });
+
+    if (!problem) {
+      throw new Error('Problem not found');
+    }
+
+    if (['RESOLVED', 'CANCELLED'].includes(problem.status)) {
+      throw new Error(`Cannot create resolution task for problem in status: ${problem.status}`);
+    }
+
+    const taskTitle = taskOverrides.title || `Resolution: ${problem.description.slice(0, 60)}...`;
+    const taskDescription = taskOverrides.description || `Task created to resolve problem #${problem.id}:\n${problem.description}`;
+    const directAssigneeId = taskOverrides.direct_assignee_id || problem.resolver_id || String(employeeId);
+
+    let resolutionTaskId = null;
+    let resolutionTask = null;
+
+    try {
+      const resp = await fetch(`${TASK_SERVICE_URL}/api/tasks/`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': taskOverrides.authHeader || '',
+          'x-user-id': String(employeeId),
+        },
+        body: JSON.stringify({
+          title: taskTitle,
+          description: taskDescription,
+          priority: taskOverrides.priority || 'HIGH',
+          assignment_mode: 'DIRECT',
+          direct_assignee_id: directAssigneeId,
+          project_id: problem.project_id || null,
+          problem_id: problem.outer_id || String(problem.id),
+        }),
+      });
+
+      if (resp.ok) {
+        resolutionTask = await resp.json();
+        resolutionTaskId = resolutionTask.outer_id || String(resolutionTask.id);
+      }
+    } catch (err) {
+      console.warn('[Problem Service] Could not reach Task Service:', err.message);
+    }
+
+    if (!resolutionTaskId) {
+      const { v4: uuidv4 } = require('crypto');
+      resolutionTaskId = uuidv4 ? uuidv4() : String(Date.now());
+      resolutionTask = { id: resolutionTaskId, title: taskTitle, problem_id: problem.id };
+    }
+
+    const updatedProblem = await prisma.problem.update({
+      where: { id: problem.id },
+      data: { resolution_task_id: resolutionTaskId }
+    });
+
+    return {
+      problem: updatedProblem,
+      resolutionTask: resolutionTask,
+    };
   }
 
   /**
    * Assign designated colleague as resolver
    */
   async assignProblemResolver(problemId, resolverId) {
-    const numericProblemId = parseInt(problemId, 10);
-    const numericResolverId = parseInt(resolverId, 10);
+    const strResolverId = String(resolverId);
 
-    const problem = await prisma.problem.findUnique({
-      where: { id: numericProblemId }
+    const problem = await prisma.problem.findFirst({
+      where: getProblemWhereClause(problemId)
     });
 
     if (!problem || !['OPEN', 'IN_PROGRESS'].includes(problem.status)) {
@@ -54,8 +150,8 @@ class ProblemService {
     }
 
     return await prisma.problem.update({
-      where: { id: numericProblemId },
-      data: { resolver_id: numericResolverId }
+      where: { id: problem.id },
+      data: { resolver_id: strResolverId }
     });
   }
 
@@ -63,11 +159,10 @@ class ProblemService {
    * Start resolution work: OPEN -> IN_PROGRESS
    */
   async startProblemResolution(problemId, employeeId) {
-    const numericProblemId = parseInt(problemId, 10);
-    const numericEmpId = parseInt(employeeId, 10);
+    const strEmpId = String(employeeId);
 
-    const problem = await prisma.problem.findUnique({
-      where: { id: numericProblemId }
+    const problem = await prisma.problem.findFirst({
+      where: getProblemWhereClause(problemId)
     });
 
     if (!problem) throw new Error('Problem not found');
@@ -76,9 +171,9 @@ class ProblemService {
       throw new Error(`Cannot start resolution on problem in status: ${problem.status}`);
     }
 
-    const resolverId = problem.resolver_id || numericEmpId;
+    const resolverId = problem.resolver_id || strEmpId;
     return await prisma.problem.update({
-      where: { id: numericProblemId },
+      where: { id: problem.id },
       data: {
         status: 'IN_PROGRESS',
         resolver_id: resolverId,
@@ -88,56 +183,58 @@ class ProblemService {
 
   /**
    * Resolve problem using Prisma transaction:
-   * Sets RESOLVED, checks if remaining blockers exist, unblocks task
+   * Sets RESOLVED, checks if remaining blockers exist on task, unblocks task
    */
   async resolveProblem(problemId, resolverId, resolutionText) {
-    const numericProblemId = parseInt(problemId, 10);
-    const numericResolverId = parseInt(resolverId, 10);
+    const strResolverId = String(resolverId);
 
     if (!resolutionText || !resolutionText.trim()) {
       throw new Error('Resolution notes are required');
     }
 
+    const targetProblem = await prisma.problem.findFirst({
+      where: getProblemWhereClause(problemId)
+    });
+
+    if (!targetProblem) throw new Error('Problem not found');
+
+    if (!['OPEN', 'IN_PROGRESS'].includes(targetProblem.status)) {
+      throw new Error(`Cannot resolve problem with status: ${targetProblem.status}`);
+    }
+
     return await prisma.$transaction(async (tx) => {
-      const problem = await tx.problem.findUnique({
-        where: { id: numericProblemId }
-      });
-
-      if (!problem) throw new Error('Problem not found');
-
-      if (!['OPEN', 'IN_PROGRESS'].includes(problem.status)) {
-        throw new Error(`Cannot resolve problem with status: ${problem.status}`);
-      }
-
       const resolvedProblem = await tx.problem.update({
-        where: { id: numericProblemId },
+        where: { id: targetProblem.id },
         data: {
           status: 'RESOLVED',
           resolved_at: new Date(),
           resolution: resolutionText.trim(),
-          resolver_id: problem.resolver_id || numericResolverId,
+          resolver_id: targetProblem.resolver_id || strResolverId,
         }
       });
 
-      // Check if any other active blockers remain on this task
-      const remainingCount = await tx.problem.count({
-        where: {
-          task_id: problem.task_id,
-          status: { in: ['OPEN', 'IN_PROGRESS'] },
-          id: { not: numericProblemId },
-        }
-      });
+      let remainingCount = 0;
+      if (targetProblem.task_id) {
+        remainingCount = await tx.problem.count({
+          where: {
+            task_id: targetProblem.task_id,
+            status: { in: ['OPEN', 'IN_PROGRESS'] },
+            id: { not: targetProblem.id },
+          }
+        });
+      }
 
-      return { resolvedProblem, remainingCount, taskId: problem.task_id };
+      return { resolvedProblem, remainingCount, taskId: targetProblem.task_id };
     }).then(({ resolvedProblem, remainingCount, taskId }) => {
-      if (remainingCount === 0) {
+      if (taskId && remainingCount === 0) {
         publishProblemEvent('problem.resolved', {
           id: resolvedProblem.id,
+          outer_id: resolvedProblem.outer_id,
           task_id: taskId,
-          resolver_id: numericResolverId,
+          resolver_id: strResolverId,
           status: 'RESOLVED',
         });
-        this.notifyTaskServiceUnblock(taskId, resolvedProblem.id).catch(() => {});
+        this.notifyTaskServiceUnblock(taskId, resolvedProblem.outer_id || resolvedProblem.id).catch(() => {});
       }
       return resolvedProblem;
     });
@@ -147,10 +244,8 @@ class ProblemService {
    * Cancel problem
    */
   async cancelProblem(problemId) {
-    const numericProblemId = parseInt(problemId, 10);
-
-    const problem = await prisma.problem.findUnique({
-      where: { id: numericProblemId }
+    const problem = await prisma.problem.findFirst({
+      where: getProblemWhereClause(problemId)
     });
 
     if (!problem || !['OPEN', 'IN_PROGRESS'].includes(problem.status)) {
@@ -158,41 +253,48 @@ class ProblemService {
     }
 
     const cancelledProblem = await prisma.problem.update({
-      where: { id: numericProblemId },
+      where: { id: problem.id },
       data: { status: 'CANCELLED' }
     });
 
-    const remainingCount = await prisma.problem.count({
-      where: {
-        task_id: problem.task_id,
-        status: { in: ['OPEN', 'IN_PROGRESS'] },
-      }
-    });
-
-    if (remainingCount === 0) {
-      publishProblemEvent('problem.cancelled', {
-        id: cancelledProblem.id,
-        task_id: problem.task_id,
+    let remainingCount = 0;
+    if (problem.task_id) {
+      remainingCount = await prisma.problem.count({
+        where: {
+          task_id: problem.task_id,
+          status: { in: ['OPEN', 'IN_PROGRESS'] },
+        }
       });
-      this.notifyTaskServiceUnblock(problem.task_id, cancelledProblem.id).catch(() => {});
+
+      if (remainingCount === 0) {
+        publishProblemEvent('problem.cancelled', {
+          id: cancelledProblem.id,
+          outer_id: cancelledProblem.outer_id,
+          task_id: problem.task_id,
+        });
+        this.notifyTaskServiceUnblock(problem.task_id, cancelledProblem.outer_id || cancelledProblem.id).catch(() => {});
+      }
     }
 
     return cancelledProblem;
   }
 
   async getProblemById(problemId) {
-    const numericProblemId = parseInt(problemId, 10);
-    const problem = await prisma.problem.findUnique({
-      where: { id: numericProblemId }
+    const problem = await prisma.problem.findFirst({
+      where: getProblemWhereClause(problemId)
     });
 
     if (!problem) return null;
 
     const employees = await prisma.employeeCache.findMany();
-    const empMap = new Map(employees.map(e => [e.id, e]));
+    const empMap = new Map();
+    employees.forEach(e => {
+      empMap.set(String(e.id), e);
+      if (e.outer_id) empMap.set(String(e.outer_id), e);
+    });
 
-    const reporter = empMap.get(problem.reported_by_id);
-    const resolver = empMap.get(problem.resolver_id);
+    const reporter = empMap.get(String(problem.reported_by_id));
+    const resolver = empMap.get(String(problem.resolver_id));
 
     return {
       ...problem,
@@ -203,19 +305,27 @@ class ProblemService {
     };
   }
 
-  async listProblemsForTask(taskId) {
-    const numericTaskId = parseInt(taskId, 10);
+  async listProblems({ taskId, projectId, status }) {
+    const where = {};
+    if (taskId) where.task_id = String(taskId);
+    if (projectId) where.project_id = String(projectId);
+    if (status) where.status = status;
+
     const problems = await prisma.problem.findMany({
-      where: { task_id: numericTaskId },
+      where,
       orderBy: { created_at: 'desc' }
     });
 
     const employees = await prisma.employeeCache.findMany();
-    const empMap = new Map(employees.map(e => [e.id, e]));
+    const empMap = new Map();
+    employees.forEach(e => {
+      empMap.set(String(e.id), e);
+      if (e.outer_id) empMap.set(String(e.outer_id), e);
+    });
 
     return problems.map(p => {
-      const reporter = empMap.get(p.reported_by_id);
-      const resolver = empMap.get(p.resolver_id);
+      const reporter = empMap.get(String(p.reported_by_id));
+      const resolver = empMap.get(String(p.resolver_id));
       return {
         ...p,
         reporter_username: reporter?.username || '',
@@ -226,25 +336,32 @@ class ProblemService {
     });
   }
 
-  // Inter-service HTTP triggers
+  async listProblemsForTask(taskId) {
+    return this.listProblems({ taskId });
+  }
+
   async notifyTaskServiceBlock(taskId, problemId) {
     try {
-      await fetch(`${TASK_SERVICE_URL}/api/tasks/${taskId}/block-internal`, {
+      await fetch(`${TASK_SERVICE_URL}/api/tasks/${taskId}/block/`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ problem_id: problemId }),
+        body: JSON.stringify({ problem_id: String(problemId) }),
       });
-    } catch (_) {}
+    } catch (e) {
+      // Best-effort HTTP notification
+    }
   }
 
   async notifyTaskServiceUnblock(taskId, problemId) {
     try {
-      await fetch(`${TASK_SERVICE_URL}/api/tasks/${taskId}/unblock-internal`, {
+      await fetch(`${TASK_SERVICE_URL}/api/tasks/${taskId}/unblock/`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ problem_id: problemId }),
+        body: JSON.stringify({ problem_id: String(problemId) }),
       });
-    } catch (_) {}
+    } catch (e) {
+      // Best-effort HTTP notification
+    }
   }
 }
 

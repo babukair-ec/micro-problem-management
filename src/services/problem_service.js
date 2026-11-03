@@ -1,5 +1,4 @@
 const prisma = require('../config/prisma');
-const { publishProblemEvent } = require('../messaging/rabbitmq');
 
 const TASK_SERVICE_URL = process.env.TASK_SERVICE_URL || 'http://localhost:5001';
 
@@ -72,23 +71,7 @@ class ProblemService {
 
     // If linked to a task, trigger task blocking
     if (strTaskId) {
-      publishProblemEvent('problem.reported', {
-        id: problem.id,
-        outer_id: problem.outer_id,
-        task_id: strTaskId,
-        project_id: strProjectId,
-        reported_by_id: strReportedById,
-        status: 'OPEN',
-      });
       await this.notifyTaskServiceBlock(strTaskId, problem.outer_id || problem.id).catch(() => {});
-    } else {
-      publishProblemEvent('problem.reported', {
-        id: problem.id,
-        outer_id: problem.outer_id,
-        project_id: strProjectId,
-        reported_by_id: strReportedById,
-        status: 'OPEN',
-      });
     }
 
     return problem;
@@ -272,13 +255,6 @@ class ProblemService {
       return { resolvedProblem, remainingCount, taskId: targetProblem.task_id };
     }).then(async ({ resolvedProblem, remainingCount, taskId }) => {
       if (taskId && remainingCount === 0) {
-        publishProblemEvent('problem.resolved', {
-          id: resolvedProblem.id,
-          outer_id: resolvedProblem.outer_id,
-          task_id: taskId,
-          resolver_id: strResolverId,
-          status: 'RESOLVED',
-        });
         await this.notifyTaskServiceUnblock(taskId, resolvedProblem.outer_id || resolvedProblem.id).catch(() => {});
       }
       return resolvedProblem;
@@ -312,11 +288,6 @@ class ProblemService {
       });
 
       if (remainingCount === 0) {
-        publishProblemEvent('problem.cancelled', {
-          id: cancelledProblem.id,
-          outer_id: cancelledProblem.outer_id,
-          task_id: problem.task_id,
-        });
         this.notifyTaskServiceUnblock(problem.task_id, cancelledProblem.outer_id || cancelledProblem.id).catch(() => {});
       }
     }

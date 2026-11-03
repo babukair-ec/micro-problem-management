@@ -2,8 +2,8 @@ const amqp = require('amqplib');
 const prisma = require('../config/prisma');
 
 const RABBITMQ_URL = process.env.RABBITMQ_URL || 'amqp://guest:guest@localhost:5672/';
-const EXCHANGE_NAME = 'task_management_events';
-const QUEUE_NAME = 'problem_service_queue';
+const EXCHANGE_NAME = process.env.RABBITMQ_EXCHANGE || 'task_management_events';
+const QUEUE_NAME = 'aboody_problem_service_queue';
 
 let channel = null;
 let connection = null;
@@ -15,6 +15,7 @@ async function startRabbitMQ() {
 
     await channel.assertExchange(EXCHANGE_NAME, 'topic', { durable: true });
     const q = await channel.assertQueue(QUEUE_NAME, { durable: true });
+    await channel.bindQueue(q.queue, EXCHANGE_NAME, 'aboody.employee.*');
     await channel.bindQueue(q.queue, EXCHANGE_NAME, 'employee.*');
 
     console.log('[RabbitMQ Problem Service] Connected and listening on exchange:', EXCHANGE_NAME);
@@ -23,7 +24,7 @@ async function startRabbitMQ() {
       if (msg !== null) {
         try {
           const content = JSON.parse(msg.content.toString());
-          if (content.event === 'employee.created' || content.event === 'employee.updated') {
+          if (content.event === 'aboody.employee.created' || content.event === 'aboody.employee.updated' || content.event === 'employee.created' || content.event === 'employee.updated') {
             const emp = content.data;
             const outerId = String(emp.outer_id || emp.id || '');
             if (outerId) {
